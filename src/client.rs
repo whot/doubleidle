@@ -16,45 +16,59 @@ use tokio::time;
 const HANDSHAKE: &str = "DOUBLEIDLE\n";
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(30);
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+const PORTAL_RECONNECT_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_PORT: u16 = 24999;
 
-// XDG restore token location
-fn get_restore_token_path() -> Result<PathBuf> {
-    let xdg_cache_dir = dirs::cache_dir()
-        .or_else(|| std::env::var("XDG_CACHE_HOME").ok().map(PathBuf::from))
-        .context("Could not determine cache directory")?;
-
-    let crate_name = env!("CARGO_PKG_NAME");
-    let cache_dir = xdg_cache_dir.join(crate_name);
-    std::fs::create_dir_all(&cache_dir)
-        .with_context(|| format!("Failed to create cache directory: {cache_dir:?}"))?;
-
-    Ok(cache_dir.join("restore_token.txt"))
+struct RestoreToken {
+    token: String,
 }
 
-// XDG restore token location
-async fn load_restore_token(path: &PathBuf) -> Option<String> {
-    match tokio::fs::read_to_string(path).await {
-        Ok(token) => {
-            let token = token.trim().to_string();
-            if token.is_empty() {
-                None
-            } else {
-                Some(token)
-            }
-        }
-        Err(_) => {
-            debug!("No existing restore token found");
-            None
+impl RestoreToken {
+    fn new(token: &str) -> RestoreToken {
+        RestoreToken {
+            token: token.into(),
         }
     }
-}
 
-async fn save_restore_token(path: &PathBuf, token: &str) -> Result<()> {
-    tokio::fs::write(path, token)
-        .await
-        .with_context(|| format!("Failed to write restore token to {path:?}"))?;
-    Ok(())
+    /// This consumes the token to indicate that we can't do anything but save it.
+    async fn save(self) -> Result<()> {
+        let path = Self::token_path()?;
+        tokio::fs::write(&path, self.token)
+            .await
+            .with_context(|| format!("Failed to write restore token to {path:?}"))?;
+        Ok(())
+    }
+
+    fn token_path() -> Result<PathBuf> {
+        let xdg_cache_dir = dirs::cache_dir()
+            .or_else(|| std::env::var("XDG_CACHE_HOME").ok().map(PathBuf::from))
+            .context("Could not determine cache directory")?;
+
+        let crate_name = env!("CARGO_PKG_NAME");
+        let cache_dir = xdg_cache_dir.join(crate_name);
+        std::fs::create_dir_all(&cache_dir)
+            .with_context(|| format!("Failed to create cache directory: {cache_dir:?}"))?;
+
+        Ok(cache_dir.join("restore_token.txt"))
+    }
+
+    async fn new_from_disk() -> Result<Option<RestoreToken>> {
+        let path = Self::token_path()?;
+        match tokio::fs::read_to_string(path).await {
+            Ok(token) => {
+                let token = token.trim().to_string();
+                if token.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(RestoreToken { token }))
+                }
+            }
+            Err(_) => {
+                debug!("No existing restore token found");
+                Ok(None)
+            }
+        }
+    }
 }
 
 fn parse_address(address: &str) -> Result<(String, u16)> {
@@ -66,6 +80,64 @@ fn parse_address(address: &str) -> Result<(String, u16)> {
     } else {
         Ok((address.to_string(), DEFAULT_PORT))
     }
+}
+
+struct PortalSession {
+    proxy: RemoteDesktop<'static>,
+    session: ashpd::desktop::Session<'static, RemoteDesktop<'static>>,
+}
+
+impl PortalSession {
+    async fn notify_pointer_motion(&self, dx: f64, dy: f64) -> ashpd::Result<()> {
+        self.proxy
+            .notify_pointer_motion(&self.session, dx, dy)
+            .await
+    }
+}
+
+/// Setup the RemoteDesktop portal session for sending motion events
+async fn setup_portal_session() -> Result<PortalSession> {
+    info!("Setting up RemoteDesktop portal session");
+
+    let proxy = RemoteDesktop::new()
+        .await
+        .context("Failed to create RemoteDesktop proxy")?;
+
+    let session = proxy
+        .create_session()
+        .await
+        .context("Failed to create portal session")?;
+
+    let devices = DeviceType::Pointer.into();
+    let persist_mode = PersistMode::ExplicitlyRevoked;
+
+    let restore_token = RestoreToken::new_from_disk().await?;
+
+    proxy
+        .select_devices(
+            &session,
+            devices,
+            restore_token.as_ref().map(|t| t.token.as_str()),
+            persist_mode,
+        )
+        .await
+        .context("Failed to select devices")?;
+
+    let start_response = proxy
+        .start(&session, Some(&WindowIdentifier::from_xid(0)))
+        .await
+        .context("Failed to start session")?;
+
+    if let Ok(data) = start_response.response() {
+        if let Some(token) = data.restore_token() {
+            if let Err(e) = RestoreToken::new(token).save().await {
+                warn!("Failed to save restore token: {}", e);
+            }
+        }
+    }
+
+    info!("RemoteDesktop portal session established successfully");
+    Ok(PortalSession { proxy, session })
 }
 
 /// Connect to the server and read the periotic idletime data.
@@ -119,42 +191,18 @@ pub async fn run(address: String, idletime_minutes: u64) -> Result<()> {
 
     let server_idle_time = Arc::new(Mutex::new(Duration::ZERO));
 
-    let restore_token_path = get_restore_token_path()?;
-    let restore_token = load_restore_token(&restore_token_path).await;
-
-    info!("Setting up RemoteDesktop portal session");
-
-    let proxy = RemoteDesktop::new()
-        .await
-        .context("Failed to create RemoteDesktop proxy")?;
-
-    let session = proxy
-        .create_session()
-        .await
-        .context("Failed to create portal session")?;
-
-    let devices = DeviceType::Pointer.into();
-    let persist_mode = PersistMode::ExplicitlyRevoked;
-
-    proxy
-        .select_devices(&session, devices, restore_token.as_deref(), persist_mode)
-        .await
-        .context("Failed to select devices")?;
-
-    let start_response = proxy
-        .start(&session, Some(&WindowIdentifier::from_xid(0)))
-        .await
-        .context("Failed to start session")?;
-
-    if let Ok(data) = start_response.response() {
-        if let Some(token) = data.restore_token() {
-            if let Err(e) = save_restore_token(&restore_token_path, token).await {
-                warn!("Failed to save restore token: {}", e);
+    // Setup initial portal session
+    let portal_session: Arc<Mutex<Option<PortalSession>>> = Arc::new(Mutex::new(
+        match setup_portal_session().await {
+            Ok(session) => Some(session),
+            Err(e) => {
+                warn!("Failed to setup initial portal session: {}", e);
+                warn!("Will retry when server activity is detected");
+                None
             }
-        }
-    }
+        },
+    ));
 
-    // The bit we write into
     let server_idle_time_w = server_idle_time.clone();
 
     // Connect to the server and read the idle time in a separate task
@@ -181,6 +229,7 @@ pub async fn run(address: String, idletime_minutes: u64) -> Result<()> {
     );
 
     let mut go_right = true; // alternate right/left mouse motion
+    let mut last_portal_reconnect_attempt = time::Instant::now() - PORTAL_RECONNECT_INTERVAL;
 
     loop {
         time::sleep(IDLE_CHECK_INTERVAL).await;
@@ -213,13 +262,46 @@ pub async fn run(address: String, idletime_minutes: u64) -> Result<()> {
             // we effectively extend by another 5:00 minutes. Shouldn't matter in real life,
             // I expect.
             if server_idle < idletime_threshold {
-                let (dx, dy) = if go_right { (1.0, 1.0) } else { (-1.0, -1.0) };
-                go_right = !go_right;
 
-                info!("Local system idle but server active, waking ourselves up");
+                // When the screen goes idle we lose the RD session, so let's try to get
+                // a new one. This requires moving the devices on the remote machine but
+                // that's just how it is. At least with the token there shouldn't be
+                // any user dialog.
+                let mut session_guard = portal_session.lock().await;
+                if session_guard.is_none() {
+                    if last_portal_reconnect_attempt.elapsed() >= PORTAL_RECONNECT_INTERVAL {
+                        info!("Portal session lost, attempting to reconnect");
+                        last_portal_reconnect_attempt = time::Instant::now();
 
-                if let Err(e) = proxy.notify_pointer_motion(&session, dx, dy).await {
-                    error!("Failed to send motion event: {}", e);
+                        match setup_portal_session().await {
+                            Ok(new_session) => {
+                                info!("Portal session reconnected successfully");
+                                *session_guard = Some(new_session);
+                            }
+                            Err(e) => {
+                                error!("Failed to reconnect portal session: {}", e);
+                                error!(
+                                    "Will retry in {} seconds",
+                                    PORTAL_RECONNECT_INTERVAL.as_secs()
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // Try to send motion event if we have a session
+                if let Some(portal) = session_guard.as_ref() {
+                    let (dx, dy) = if go_right { (1.0, 1.0) } else { (-1.0, -1.0) };
+                    go_right = !go_right;
+
+                    info!("Local system idle but server active, waking ourselves up");
+
+                    if let Err(e) = portal.notify_pointer_motion(dx, dy).await {
+                        error!("Failed to send motion event: {}", e);
+                        warn!("Marking portal session as lost");
+                        *session_guard = None;
+                        last_portal_reconnect_attempt = time::Instant::now();
+                    }
                 }
             }
         }
