@@ -17,17 +17,23 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Run a doubleidle server (do this on the machine you use actively)
     Server {
+        /// The port to connect to
         #[arg(long, default_value = "24999")]
         port: u16,
 
+        /// Seconds between server → client activity notifications
         #[arg(long, default_value = "30")]
         interval: u64,
     },
+    /// Run a doubleidle client (do this on the secondary machine)
     Client {
-        #[arg(long, default_value = "5")]
+        /// The maximum client-local idle time before we reset the idle time
+        #[arg(long, default_value = "4")]
         idletime_minutes: u64,
 
+        /// doubleidle server host to connect to
         #[arg(value_name = "HOST[:PORT]")]
         address: String,
     },
