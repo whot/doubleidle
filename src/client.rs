@@ -191,6 +191,7 @@ async fn connect_and_read_idle_time(
     host: &str,
     port: u16,
     server_idle_time: Arc<Mutex<Duration>>,
+    server_connected: Arc<Mutex<bool>>,
 ) -> Result<()> {
     let mut stream = TcpStream::connect(format!("{}:{}", host, port))
         .await
@@ -205,6 +206,12 @@ async fn connect_and_read_idle_time(
     stream.flush().await.context("Failed to flush handshake")?;
 
     debug!("Handshake sent successfully");
+
+    // Mark as connected
+    {
+        let mut connected = server_connected.lock().await;
+        *connected = true;
+    }
 
     let mut buf = [0u8; 8];
     loop {
@@ -258,6 +265,7 @@ pub async fn run(address: Option<String>, idletime_minutes: u64) -> Result<()> {
     let idletime_threshold = Duration::from_secs(idletime_minutes * 60);
 
     let server_idle_time = Arc::new(Mutex::new(Duration::ZERO));
+    let server_connected = Arc::new(Mutex::new(false));
 
     // Setup initial portal session
     let portal_session: Arc<Mutex<Option<PortalSession>>> = Arc::new(Mutex::new(
@@ -272,17 +280,23 @@ pub async fn run(address: Option<String>, idletime_minutes: u64) -> Result<()> {
     ));
 
     let server_idle_time_w = server_idle_time.clone();
+    let server_connected_w = server_connected.clone();
 
     // Connect to the server and read the idle time in a separate task
     // so we can run concurrently
     tokio::spawn(async move {
         loop {
             info!("Connecting to {}:{}", host, port);
-            match connect_and_read_idle_time(&host, port, server_idle_time_w.clone()).await {
+            match connect_and_read_idle_time(&host, port, server_idle_time_w.clone(), server_connected_w.clone()).await {
                 Ok(_) => {
                     info!("Connection closed normally");
                 }
                 Err(e) => {
+                    // Mark as disconnected
+                    {
+                        let mut connected = server_connected_w.lock().await;
+                        *connected = false;
+                    }
                     error!("Connection failed: {}", e);
                     info!("Retrying in {} seconds", RECONNECT_INTERVAL.as_secs());
                     time::sleep(RECONNECT_INTERVAL).await;
@@ -300,6 +314,14 @@ pub async fn run(address: Option<String>, idletime_minutes: u64) -> Result<()> {
     let mut last_portal_reconnect_attempt = time::Instant::now() - PORTAL_RECONNECT_INTERVAL;
 
     loop {
+        let is_connected = {
+            let connected = server_connected.lock().await;
+            *connected
+        };
+        if !is_connected {
+            continue;
+        }
+
         time::sleep(IDLE_CHECK_INTERVAL).await;
 
         // Apparently system_idle_time isnt async compatible so we need
