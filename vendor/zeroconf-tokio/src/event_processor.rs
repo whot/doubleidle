@@ -54,6 +54,8 @@ impl EventProcessor {
                     .poll(timeout)
                     .expect("should have been able to poll event loop");
                 tokio::task::yield_now().await;
+                // HOTPATCH: Add 1 second delay to reduce CPU usage
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         }));
 
