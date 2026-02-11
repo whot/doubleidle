@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use anyhow::{Context, Result};
+#[cfg(feature = "zeroconf")]
+use zeroconf_tokio::{prelude::*, MdnsService, MdnsServiceAsync, ServiceType};
 use log::{debug, error, info, warn};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -16,6 +18,29 @@ pub async fn run(port: u16, interval_secs: u64) -> Result<()> {
         .with_context(|| format!("Failed to bind to port {}", port))?;
 
     info!("Server listening on port {}", port);
+
+    // Register mDNS service
+    #[cfg(feature = "zeroconf")]
+    let _service = {
+        let service_type = ServiceType::new("doubleidle", "tcp")
+            .context("Failed to create service type")?;
+        let mut service = MdnsService::new(service_type, port);
+        service.set_name("doubleidle-server");
+
+        let mut service_async = MdnsServiceAsync::new(service)
+            .context("Failed to create async service")?;
+
+        match service_async.start().await {
+            Ok(_) => {
+                info!("Registered mDNS service: _doubleidle._tcp.local on port {}", port);
+                Some(service_async)
+            }
+            Err(e) => {
+                warn!("Failed to register mDNS service: {}. Server will run but won't be discoverable.", e);
+                None
+            }
+        }
+    };
 
     let (tx, _rx) = broadcast::channel::<Duration>(16);
 

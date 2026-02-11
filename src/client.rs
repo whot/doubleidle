@@ -4,6 +4,8 @@ use anyhow::{Context, Result};
 use ashpd::desktop::remote_desktop::{DeviceType, RemoteDesktop};
 use ashpd::desktop::PersistMode;
 use ashpd::WindowIdentifier;
+#[cfg(feature = "zeroconf")]
+use zeroconf_tokio::{prelude::*, BrowserEvent, MdnsBrowser, MdnsBrowserAsync, ServiceType};
 use log::{debug, error, info, warn};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -80,6 +82,48 @@ fn parse_address(address: &str) -> Result<(String, u16)> {
     } else {
         Ok((address.to_string(), DEFAULT_PORT))
     }
+}
+
+/// Discover a doubleidle server via mDNS/zeroconf
+#[cfg(feature = "zeroconf")]
+async fn discover_server(timeout: Duration) -> Result<Option<(String, u16)>> {
+    info!("Discovering doubleidle servers via mDNS...");
+
+    let service_type = ServiceType::new("doubleidle", "tcp")
+        .context("Failed to create service type")?;
+    let browser = MdnsBrowser::new(service_type);
+    let mut browser_async = MdnsBrowserAsync::new(browser)
+        .context("Failed to create async browser")?;
+
+    browser_async.start_with_timeout(timeout).await
+        .context("Failed to start mDNS browser")?;
+
+    // Wait for first service discovery
+    while let Some(event_result) = browser_async.next().await {
+        match event_result {
+            Ok(BrowserEvent::Add(service)) => {
+                let host = service.host_name().to_string();
+                let port = *service.port();
+                info!("Discovered server at {}:{}", host, port);
+
+                // Shutdown browser to clean up
+                let _ = browser_async.shutdown().await;
+
+                return Ok(Some((host, port)));
+            }
+            Ok(BrowserEvent::Remove(_)) => {
+                debug!("Service removed, continuing search...");
+                continue;
+            }
+            Err(e) => {
+                debug!("Browser error: {}", e);
+                continue;
+            }
+        }
+    }
+
+    // Timeout or no services found
+    Ok(None)
 }
 
 struct PortalSession {
@@ -185,8 +229,32 @@ async fn connect_and_read_idle_time(
 /// monitor events from the server and whenever our *own* idle
 /// time exceeds the threshold, send a tiny fake motion event - provided
 /// the server wasn't idle past the threshold.
-pub async fn run(address: String, idletime_minutes: u64) -> Result<()> {
-    let (host, port) = parse_address(&address)?;
+pub async fn run(address: Option<String>, idletime_minutes: u64) -> Result<()> {
+    let (host, port) = match address {
+        Some(addr) => parse_address(&addr)?,
+        None => {
+            #[cfg(feature = "zeroconf")]
+            {
+                match discover_server(Duration::from_secs(10)).await? {
+                    Some(discovered) => discovered,
+                    None => {
+                        anyhow::bail!(
+                            "No doubleidle server found via mDNS after 10 seconds.\n\
+                             Try specifying the server address explicitly:\n  \
+                             doubleidle client <server-hostname>"
+                        );
+                    }
+                }
+            }
+            #[cfg(not(feature = "zeroconf"))]
+            {
+                anyhow::bail!(
+                    "Server address required. Zeroconf support not enabled.\n\
+                     Usage: doubleidle client <server-hostname>"
+                );
+            }
+        }
+    };
     let idletime_threshold = Duration::from_secs(idletime_minutes * 60);
 
     let server_idle_time = Arc::new(Mutex::new(Duration::ZERO));

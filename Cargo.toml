@@ -3,6 +3,10 @@ name = "doubleidle"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["zeroconf"]
+zeroconf = ["dep:zeroconf-tokio"]
+
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 log = "0.4"
@@ -11,5 +15,6 @@ system-idle-time = "1.0"
 tokio = { version = "1.42", features = ["full"] }
 anyhow = "1.0"
 ashpd = "0.12"
+zeroconf-tokio = { version = "0.3.0", optional = true }
 dirs = "5.0"
 chrono = "0.4"

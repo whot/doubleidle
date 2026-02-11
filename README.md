@@ -27,8 +27,10 @@ fall asleep, or lock the screen, or whatever it thinks is appropriate.
 This is a typical Rust project, see the Rust documentation for details on
 cargo.
 
+We recommend to build with zeroconf support so server detection is automatic.
+
 ```
-$ cargo build
+$ cargo build --features zeroconf
 $ cargo install
 ```
 
@@ -36,6 +38,11 @@ And then run it on the machines as server or client:
 
 ```console
 main-machine> doubleidle server
+
+# If zeroconf was enabled, you can skip the hostname argument
+second-machine> doubleidle client
+
+# Otherwise connect to a specific client:
 second-machine> doubleidle client main-machine.local
 ```
 

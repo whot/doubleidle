@@ -33,15 +33,17 @@ enum Commands {
         #[arg(long, default_value = "4")]
         idletime_minutes: u64,
 
-        /// doubleidle server host to connect to
+        /// Server address (HOST[:PORT]). If omitted, discovers server via mDNS.
         #[arg(value_name = "HOST[:PORT]")]
-        address: String,
+        address: Option<String>,
     },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .filter_module("zeroconf_tokio", log::LevelFilter::Off)
+        .filter_module("zeroconf", log::LevelFilter::Off)
         .format(|buf, record| {
             use std::io::Write;
             let now = chrono::Local::now();
@@ -69,10 +71,18 @@ async fn main() -> Result<()> {
             idletime_minutes,
             address,
         } => {
-            info!(
-                "Starting client connecting to {} with idle time threshold of {} minutes",
-                address, idletime_minutes
-            );
+            if address.is_none() {
+                info!(
+                    "Starting client with mDNS discovery, idle threshold {} minutes",
+                    idletime_minutes
+                );
+            } else {
+                info!(
+                    "Starting client connecting to {}, idle threshold {} minutes",
+                    address.as_ref().unwrap(),
+                    idletime_minutes
+                );
+            }
             client::run(address, idletime_minutes).await?;
         }
     }
