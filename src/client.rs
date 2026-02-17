@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use anyhow::{Context, Result};
-use ashpd::desktop::remote_desktop::{DeviceType, RemoteDesktop};
-use ashpd::desktop::PersistMode;
-use ashpd::WindowIdentifier;
+use ashpd::desktop::inhibit::{InhibitFlags, InhibitProxy};
+use ashpd::desktop::Request;
 #[cfg(feature = "zeroconf")]
 use zeroconf_tokio::{prelude::*, BrowserEvent, MdnsBrowser, MdnsBrowserAsync, ServiceType};
-use log::{debug, error, info, warn};
-use std::path::PathBuf;
+use log::{debug, error, info};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -17,61 +15,9 @@ use tokio::time;
 
 const HANDSHAKE: &str = "DOUBLEIDLE\n";
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(30);
-const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
-const PORTAL_RECONNECT_INTERVAL: Duration = Duration::from_secs(5);
 const DEFAULT_PORT: u16 = 24999;
-
-struct RestoreToken {
-    token: String,
-}
-
-impl RestoreToken {
-    fn new(token: &str) -> RestoreToken {
-        RestoreToken {
-            token: token.into(),
-        }
-    }
-
-    /// This consumes the token to indicate that we can't do anything but save it.
-    async fn save(self) -> Result<()> {
-        let path = Self::token_path()?;
-        tokio::fs::write(&path, self.token)
-            .await
-            .with_context(|| format!("Failed to write restore token to {path:?}"))?;
-        Ok(())
-    }
-
-    fn token_path() -> Result<PathBuf> {
-        let xdg_cache_dir = dirs::cache_dir()
-            .or_else(|| std::env::var("XDG_CACHE_HOME").ok().map(PathBuf::from))
-            .context("Could not determine cache directory")?;
-
-        let crate_name = env!("CARGO_PKG_NAME");
-        let cache_dir = xdg_cache_dir.join(crate_name);
-        std::fs::create_dir_all(&cache_dir)
-            .with_context(|| format!("Failed to create cache directory: {cache_dir:?}"))?;
-
-        Ok(cache_dir.join("restore_token.txt"))
-    }
-
-    async fn new_from_disk() -> Result<Option<RestoreToken>> {
-        let path = Self::token_path()?;
-        match tokio::fs::read_to_string(path).await {
-            Ok(token) => {
-                let token = token.trim().to_string();
-                if token.is_empty() {
-                    Ok(None)
-                } else {
-                    Ok(Some(RestoreToken { token }))
-                }
-            }
-            Err(_) => {
-                debug!("No existing restore token found");
-                Ok(None)
-            }
-        }
-    }
-}
+const TIMER_BUFFER: Duration = Duration::from_secs(5);
+const ONE_DAY: Duration = Duration::from_secs(86400);
 
 fn parse_address(address: &str) -> Result<(String, u16)> {
     if let Some((host, port_str)) = address.rsplit_once(':') {
@@ -126,72 +72,17 @@ async fn discover_server(timeout: Duration) -> Result<Option<(String, u16)>> {
     Ok(None)
 }
 
-struct PortalSession {
-    proxy: RemoteDesktop<'static>,
-    session: ashpd::desktop::Session<'static, RemoteDesktop<'static>>,
-}
 
-impl PortalSession {
-    async fn notify_pointer_motion(&self, dx: f64, dy: f64) -> ashpd::Result<()> {
-        self.proxy
-            .notify_pointer_motion(&self.session, dx, dy)
-            .await
-    }
-}
-
-/// Setup the RemoteDesktop portal session for sending motion events
-async fn setup_portal_session() -> Result<PortalSession> {
-    info!("Setting up RemoteDesktop portal session");
-
-    let proxy = RemoteDesktop::new()
-        .await
-        .context("Failed to create RemoteDesktop proxy")?;
-
-    let session = proxy
-        .create_session()
-        .await
-        .context("Failed to create portal session")?;
-
-    let devices = DeviceType::Pointer.into();
-    let persist_mode = PersistMode::ExplicitlyRevoked;
-
-    let restore_token = RestoreToken::new_from_disk().await?;
-
-    proxy
-        .select_devices(
-            &session,
-            devices,
-            restore_token.as_ref().map(|t| t.token.as_str()),
-            persist_mode,
-        )
-        .await
-        .context("Failed to select devices")?;
-
-    let start_response = proxy
-        .start(&session, Some(&WindowIdentifier::from_xid(0)))
-        .await
-        .context("Failed to start session")?;
-
-    if let Ok(data) = start_response.response() {
-        if let Some(token) = data.restore_token() {
-            if let Err(e) = RestoreToken::new(token).save().await {
-                warn!("Failed to save restore token: {}", e);
-            }
-        }
-    }
-
-    info!("RemoteDesktop portal session established successfully");
-    Ok(PortalSession { proxy, session })
-}
-
-/// Connect to the server and read the periotic idletime data.
+/// Connect to the server and read the periodic idletime data.
 ///
 /// idletimedata is saved into `server_idle_time` for processing by the caller.
+/// Sends a notification on `idle_update_notify` when a new idle time is received.
 async fn connect_and_read_idle_time(
     host: &str,
     port: u16,
     server_idle_time: Arc<Mutex<Duration>>,
     server_connected: Arc<Mutex<bool>>,
+    idle_update_notify: tokio::sync::mpsc::UnboundedSender<()>,
 ) -> Result<()> {
     let mut stream = TcpStream::connect(format!("{}:{}", host, port))
         .await
@@ -222,8 +113,16 @@ async fn connect_and_read_idle_time(
 
                 debug!("Received server idle time: {:?}", idle_duration);
 
+                // Update server idle time
                 let mut server_idle = server_idle_time.lock().await;
                 *server_idle = idle_duration;
+                drop(server_idle);
+
+                // Notify main loop of new idle time
+                if idle_update_notify.send(()).is_err() {
+                    // Receiver dropped, main loop is gone
+                    anyhow::bail!("Main loop channel closed");
+                }
             }
             Err(e) => {
                 anyhow::bail!("Failed to read from server: {}", e);
@@ -233,9 +132,9 @@ async fn connect_and_read_idle_time(
 }
 
 /// Connect to the server given in address. Once connected,
-/// monitor events from the server and whenever our *own* idle
-/// time exceeds the threshold, send a tiny fake motion event - provided
-/// the server wasn't idle past the threshold.
+/// use the Inhibit portal to prevent suspend/idle and keep reading
+/// server idle time info. Once the server idle info goes past the threshold
+/// drop the Inhibit lock.
 pub async fn run(address: Option<String>, idletime_seconds: u64) -> Result<()> {
     let (host, port) = match address {
         Some(addr) => parse_address(&addr)?,
@@ -267,17 +166,17 @@ pub async fn run(address: Option<String>, idletime_seconds: u64) -> Result<()> {
     let server_idle_time = Arc::new(Mutex::new(Duration::ZERO));
     let server_connected = Arc::new(Mutex::new(false));
 
-    // Setup initial portal session
-    let portal_session: Arc<Mutex<Option<PortalSession>>> = Arc::new(Mutex::new(
-        match setup_portal_session().await {
-            Ok(session) => Some(session),
-            Err(e) => {
-                warn!("Failed to setup initial portal session: {}", e);
-                warn!("Will retry when server activity is detected");
-                None
-            }
-        },
-    ));
+    // Setup Inhibit portal proxy
+    let inhibit_proxy = InhibitProxy::new()
+        .await
+        .context("Failed to create Inhibit proxy")?;
+    info!("Inhibit portal proxy created successfully");
+
+    // Track the active inhibit request
+    let inhibit_request: Arc<Mutex<Option<Request<()>>>> = Arc::new(Mutex::new(None));
+
+    // Channel for notifying main loop of idle time updates
+    let (idle_update_tx, mut idle_update_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let server_idle_time_w = server_idle_time.clone();
     let server_connected_w = server_connected.clone();
@@ -287,9 +186,17 @@ pub async fn run(address: Option<String>, idletime_seconds: u64) -> Result<()> {
     tokio::spawn(async move {
         loop {
             info!("Connecting to {}:{}", host, port);
-            match connect_and_read_idle_time(&host, port, server_idle_time_w.clone(), server_connected_w.clone()).await {
+            match connect_and_read_idle_time(&host, port, server_idle_time_w.clone(), server_connected_w.clone(), idle_update_tx.clone()).await {
                 Ok(_) => {
+                    // Mark as disconnected and notify main loop
+                    {
+                        let mut connected = server_connected_w.lock().await;
+                        *connected = false;
+                    }
+                    let _ = idle_update_tx.send(());
                     info!("Connection closed normally");
+                    info!("Retrying in {} seconds", RECONNECT_INTERVAL.as_secs());
+                    time::sleep(RECONNECT_INTERVAL).await;
                 }
                 Err(e) => {
                     // Mark as disconnected
@@ -297,6 +204,8 @@ pub async fn run(address: Option<String>, idletime_seconds: u64) -> Result<()> {
                         let mut connected = server_connected_w.lock().await;
                         *connected = false;
                     }
+                    // Notify main loop of disconnection to drop inhibit lock immediately
+                    let _ = idle_update_tx.send(());
                     error!("Connection failed: {}", e);
                     info!("Retrying in {} seconds", RECONNECT_INTERVAL.as_secs());
                     time::sleep(RECONNECT_INTERVAL).await;
@@ -310,89 +219,142 @@ pub async fn run(address: Option<String>, idletime_seconds: u64) -> Result<()> {
         idletime_threshold.as_secs()
     );
 
-    let mut go_right = true; // alternate right/left mouse motion
-    let mut last_portal_reconnect_attempt = time::Instant::now() - PORTAL_RECONNECT_INTERVAL;
+    let mut previous_server_idle: Option<Duration> = None;
+    // Start with a very long sleep that will be replaced on first update
+    let sleep = time::sleep(ONE_DAY);
+    tokio::pin!(sleep);
 
     loop {
-        let is_connected = {
-            let connected = server_connected.lock().await;
-            *connected
-        };
-        if !is_connected {
-            continue;
-        }
+        tokio::select! {
+            msg = idle_update_rx.recv() => {
+                // Check if channel was closed (all senders dropped)
+                if msg.is_none() {
+                    error!("Server connection channel closed unexpectedly");
+                    anyhow::bail!("Server connection channel closed");
+                }
 
-        time::sleep(IDLE_CHECK_INTERVAL).await;
+                // Received new idle time from server
+                let is_connected = *server_connected.lock().await;
 
-        // Apparently system_idle_time isnt async compatible so we need
-        // to spawn that off for the read
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        std::thread::spawn(move || {
-            let idle = system_idle_time::get_idle_time().unwrap_or(Duration::ZERO);
-            let _ = tx.send(idle);
-        });
+                if !is_connected {
+                    // Drop inhibit lock immediately when server disconnects
+                    let mut request_guard = inhibit_request.lock().await;
+                    if request_guard.is_some() {
+                        info!("Server disconnected, dropping inhibit lock");
+                        *request_guard = None;
+                    }
+                    // Reset timer since we're no longer tracking server state
+                    sleep.as_mut().reset(time::Instant::now() + ONE_DAY);
+                    previous_server_idle = None;
+                    continue;
+                }
 
-        let local_idle = rx.await.unwrap_or(Duration::ZERO);
+                let server_idle = *server_idle_time.lock().await;
 
-        debug!("Local idle time: {:?}", local_idle);
+                debug!("Server idle update received: {:?} (previous: {:?})", server_idle, previous_server_idle);
 
-        // We've been idle past the threshold, check if our server
-        // was idle too.
-        if local_idle >= idletime_threshold {
-            let server_idle = {
-                let idle_time = server_idle_time.lock().await;
-                *idle_time
-            };
+                // Check if server is already past threshold
+                if server_idle >= idletime_threshold {
+                    debug!("Server idle ({:?}) already past threshold ({:?})", server_idle, idletime_threshold);
+                    let mut request_guard = inhibit_request.lock().await;
+                    if request_guard.is_some() {
+                        info!("Server idle ({:?}) past threshold ({:?}), dropping inhibit lock",
+                            server_idle, idletime_threshold);
+                        *request_guard = None;
+                    }
+                    // Reset timer to prevent unnecessary firing
+                    sleep.as_mut().reset(time::Instant::now() + ONE_DAY);
+                    previous_server_idle = Some(server_idle);
+                    continue;
+                }
 
-            debug!("Local idle: {local_idle:?}, server idle: {server_idle:?}",);
+                // Detect server activity or threshold crossing
+                let should_have_lock = if let Some(prev) = previous_server_idle {
+                    // Subsequent reading: check if activity detected
+                    let activity = server_idle < prev;
 
-            // Server had some event less than our threshold, so let's fake a motion event.
-            //
-            // This isn't very precise, if the server moved 4:59 min ago on a 5:00 timeout
-            // we effectively extend by another 5:00 minutes. Shouldn't matter in real life,
-            // I expect.
-            if server_idle < idletime_threshold {
+                    if activity {
+                        debug!("Server activity detected: idle went from {:?} to {:?}", prev, server_idle);
+                        true
+                    } else {
+                        // No activity, maintain current lock state
+                        inhibit_request.lock().await.is_some()
+                    }
+                } else {
+                    // First reading: create lock since we're below threshold
+                    true
+                };
 
-                // When the screen goes idle we lose the RD session, so let's try to get
-                // a new one. This requires moving the devices on the remote machine but
-                // that's just how it is. At least with the token there shouldn't be
-                // any user dialog.
-                let mut session_guard = portal_session.lock().await;
-                if session_guard.is_none() {
-                    if last_portal_reconnect_attempt.elapsed() >= PORTAL_RECONNECT_INTERVAL {
-                        info!("Portal session lost, attempting to reconnect");
-                        last_portal_reconnect_attempt = time::Instant::now();
+                let mut request_guard = inhibit_request.lock().await;
 
-                        match setup_portal_session().await {
-                            Ok(new_session) => {
-                                info!("Portal session reconnected successfully");
-                                *session_guard = Some(new_session);
-                            }
-                            Err(e) => {
-                                error!("Failed to reconnect portal session: {}", e);
-                                error!(
-                                    "Will retry in {} seconds",
-                                    PORTAL_RECONNECT_INTERVAL.as_secs()
-                                );
-                            }
+                if should_have_lock && request_guard.is_none() {
+                    info!("Server active ({:?}), creating inhibit lock", server_idle);
+
+                    let flags = InhibitFlags::Suspend | InhibitFlags::Idle;
+                    match inhibit_proxy
+                        .inhibit(None, flags, "Doubleidle server still active")
+                        .await
+                    {
+                        Ok(request) => {
+                            info!("Inhibit lock created successfully");
+                            *request_guard = Some(request);
+                        }
+                        Err(e) => {
+                            error!("Failed to create inhibit lock: {}", e);
                         }
                     }
                 }
 
-                // Try to send motion event if we have a session
-                if let Some(portal) = session_guard.as_ref() {
-                    let (dx, dy) = if go_right { (1.0, 1.0) } else { (-1.0, -1.0) };
-                    go_right = !go_right;
+                drop(request_guard);
 
-                    info!("Local system idle but server active, waking ourselves up");
+                // Reset the timer when server idle time doesn't increase (activity detected or
+                // stayed same) or this is the first reading. The timer will drop the lock at
+                // the right time even if the server doesn't notify us.
+                if previous_server_idle.is_none_or(|prev| server_idle <= prev) {
+                    let time_until_threshold = idletime_threshold.saturating_sub(server_idle);
+                    let timer_duration = time_until_threshold + TIMER_BUFFER;
 
-                    if let Err(e) = portal.notify_pointer_motion(dx, dy).await {
-                        error!("Failed to send motion event: {}", e);
-                        warn!("Marking portal session as lost");
-                        *session_guard = None;
-                        last_portal_reconnect_attempt = time::Instant::now();
-                    }
+                    debug!("Setting drop timer for {:?} (server idle: {:?}, threshold: {:?}, buffer: {:?})",
+                        timer_duration, server_idle, idletime_threshold, TIMER_BUFFER);
+
+                    // Reset the timer
+                    sleep.as_mut().reset(time::Instant::now() + timer_duration);
                 }
+
+                previous_server_idle = Some(server_idle);
+            }
+
+            _ = &mut sleep => {
+                // Timer fired - server must have gone idle past threshold
+                debug!("Drop timer fired");
+
+                // Reset timer to prevent continuous firing
+                sleep.as_mut().reset(time::Instant::now() + ONE_DAY);
+
+                let is_connected = *server_connected.lock().await;
+
+                if !is_connected {
+                    info!("Timer fired but server disconnected, dropping inhibit lock");
+                    let mut request_guard = inhibit_request.lock().await;
+                    if request_guard.is_some() {
+                        *request_guard = None;
+                    }
+                    previous_server_idle = None;
+                    continue;
+                }
+
+                let server_idle = *server_idle_time.lock().await;
+
+                let mut request_guard = inhibit_request.lock().await;
+                if request_guard.is_some() {
+                    info!("Timer fired: server idle ({:?}) past threshold ({:?}), dropping inhibit lock",
+                        server_idle, idletime_threshold);
+                    *request_guard = None;
+                }
+
+                // Reset previous_server_idle so next update is treated as a fresh start
+                // This ensures the lock will be recreated if server is still below threshold
+                previous_server_idle = None;
             }
         }
     }
