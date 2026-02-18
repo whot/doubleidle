@@ -236,7 +236,7 @@ async fn connect_and_read_idle_time(
 /// monitor events from the server and whenever our *own* idle
 /// time exceeds the threshold, send a tiny fake motion event - provided
 /// the server wasn't idle past the threshold.
-pub async fn run(address: Option<String>, idletime_minutes: u64) -> Result<()> {
+pub async fn run(address: Option<String>, idletime_seconds: u64) -> Result<()> {
     let (host, port) = match address {
         Some(addr) => parse_address(&addr)?,
         None => {
@@ -262,7 +262,7 @@ pub async fn run(address: Option<String>, idletime_minutes: u64) -> Result<()> {
             }
         }
     };
-    let idletime_threshold = Duration::from_secs(idletime_minutes * 60);
+    let idletime_threshold = Duration::from_secs(idletime_seconds);
 
     let server_idle_time = Arc::new(Mutex::new(Duration::ZERO));
     let server_connected = Arc::new(Mutex::new(false));
