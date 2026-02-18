@@ -2,24 +2,6 @@
 
 A simple utility that keeps a remote host awake while another host is being used.
 
-```
-     Main Desktop (server)          Secondary Machine (client)
-
-        ┌──────────────────┐            ┌────────────────┐
-        │                  │            │ ┌────────────┐ │
-        │                  │            │ │            │ │
-        │    ¯\_(ツ)_/¯    │            │ │   (o_o)    │ │
-        │                  │   ◄──────► │ │            │ │
-        │                  │            │ └────────────┘ │
-        └──────────────────┘            ├────────────────┤
-             ║           ║              │[]  [][][]  [][]│
-    ┌────────╨───────┐┌──╨───┐          │[][][][][][][][]│
-    │[]  [][][]  [][]││ │  │ │          │[][][      ][][]│
-    │[][][][][][][][]││      │          │                │
-    │[][][      ][][]││      │          └────────────────┘
-    └────────────────┘└──────┘
-```
-
 Imagine you have two hosts, one is your main desktop you work on and another machine
 that you need to periodically look at but not typically interact with. For
 example, you may have a reference manual open on that machine.
