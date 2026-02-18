@@ -40,7 +40,7 @@ struct Cli {
 enum Commands {
     /// Run a doubleidle server (do this on the machine you use actively)
     Server {
-        /// The port to connect to
+        /// The port to listen on
         #[arg(long, default_value = "24999")]
         port: u16,
 
