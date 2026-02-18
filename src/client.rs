@@ -20,7 +20,29 @@ const TIMER_BUFFER: Duration = Duration::from_secs(5);
 const ONE_DAY: Duration = Duration::from_secs(86400);
 
 fn parse_address(address: &str) -> Result<(String, u16)> {
+    // Handle [host]:port format (for IPv6 addresses)
+    if let Some(addr) = address.strip_prefix('[') {
+        if let Some((host, port_str)) = addr.split_once("]:") {
+            let port = port_str
+                .parse::<u16>()
+                .with_context(|| format!("Invalid port: {}", port_str))?;
+            return Ok((host.to_string(), port));
+        } else if let Some(host) = addr.strip_suffix(']') {
+            return Ok((host.to_string(), DEFAULT_PORT));
+        } else {
+            anyhow::bail!("Invalid address format: missing closing bracket");
+        }
+    }
+
+    // Handle host:port format (for IPv4 and hostnames)
     if let Some((host, port_str)) = address.rsplit_once(':') {
+        // Check if this might be an IPv6 address without brackets
+        // (contains more than one colon)
+        if host.contains(':') {
+            // This is likely a bare IPv6 address without port
+            return Ok((address.to_string(), DEFAULT_PORT));
+        }
+
         let port = port_str
             .parse::<u16>()
             .with_context(|| format!("Invalid port: {}", port_str))?;
@@ -84,9 +106,18 @@ async fn connect_and_read_idle_time(
     server_connected: Arc<Mutex<bool>>,
     idle_update_notify: tokio::sync::mpsc::UnboundedSender<()>,
 ) -> Result<()> {
-    let mut stream = TcpStream::connect(format!("{}:{}", host, port))
+    // Format address for connection - wrap IPv6 addresses in brackets
+    let connection_addr = if host.contains(':') {
+        // IPv6 address needs brackets
+        format!("[{}]:{}", host, port)
+    } else {
+        // IPv4 or hostname
+        format!("{}:{}", host, port)
+    };
+
+    let mut stream = TcpStream::connect(&connection_addr)
         .await
-        .with_context(|| format!("Failed to connect to {}:{}", host, port))?;
+        .with_context(|| format!("Failed to connect to {}", connection_addr))?;
 
     debug!("Connected to server, sending handshake");
 
@@ -357,5 +388,63 @@ pub async fn run(address: Option<String>, idletime_seconds: u64) -> Result<()> {
                 previous_server_idle = None;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_address_ipv4() {
+        // IPv4 with port
+        assert_eq!(parse_address("192.168.1.1:8080").unwrap(), ("192.168.1.1".to_string(), 8080));
+
+        // IPv4 without port (uses default)
+        assert_eq!(parse_address("192.168.1.1").unwrap(), ("192.168.1.1".to_string(), DEFAULT_PORT));
+    }
+
+    #[test]
+    fn test_parse_address_hostname() {
+        // Hostname with port
+        assert_eq!(parse_address("example.com:8080").unwrap(), ("example.com".to_string(), 8080));
+
+        // Hostname without port
+        assert_eq!(parse_address("example.com").unwrap(), ("example.com".to_string(), DEFAULT_PORT));
+
+        // Hostname with subdomain
+        assert_eq!(parse_address("foo.bar.example.com:9999").unwrap(), ("foo.bar.example.com".to_string(), 9999));
+    }
+
+    #[test]
+    fn test_parse_address_ipv6_brackets() {
+        // IPv6 with brackets and port
+        assert_eq!(parse_address("[fe80::1]:8080").unwrap(), ("fe80::1".to_string(), 8080));
+        assert_eq!(parse_address("[::1]:24999").unwrap(), ("::1".to_string(), 24999));
+        assert_eq!(parse_address("[2001:db8::1]:443").unwrap(), ("2001:db8::1".to_string(), 443));
+
+        // IPv6 with brackets but no port (uses default)
+        assert_eq!(parse_address("[fe80::1]").unwrap(), ("fe80::1".to_string(), DEFAULT_PORT));
+        assert_eq!(parse_address("[::1]").unwrap(), ("::1".to_string(), DEFAULT_PORT));
+    }
+
+    #[test]
+    fn test_parse_address_ipv6_bare() {
+        // Bare IPv6 addresses without brackets (no port possible)
+        assert_eq!(parse_address("fe80::1").unwrap(), ("fe80::1".to_string(), DEFAULT_PORT));
+        assert_eq!(parse_address("::1").unwrap(), ("::1".to_string(), DEFAULT_PORT));
+        assert_eq!(parse_address("2001:db8::1").unwrap(), ("2001:db8::1".to_string(), DEFAULT_PORT));
+        assert_eq!(parse_address("fe80::1:2345").unwrap(), ("fe80::1:2345".to_string(), DEFAULT_PORT));
+    }
+
+    #[test]
+    fn test_parse_address_invalid() {
+        // Missing closing bracket
+        assert!(parse_address("[fe80::1").is_err());
+
+        // Invalid port
+        assert!(parse_address("example.com:99999").is_err());
+        assert!(parse_address("[fe80::1]:99999").is_err());
+        assert!(parse_address("example.com:abc").is_err());
     }
 }
