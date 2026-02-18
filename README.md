@@ -14,9 +14,9 @@ an option, because security.
 connect to it from the other machine(s). The server will periodically update
 the clients with the idle time on the server.
 
-While the server is active (idle time below threshold), the client
-to prevent the machine from going to sleep or engaging the screensaver
-via the [Inhibit portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.Inhibit.html)
+While the server is active (idle time below threshold), the client prevents
+the machine from going to sleep or engaging the screensaver via the
+[Inhibit portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.Inhibit.html).
 
 Once the server's idle time goes past the (client-specific) threshold, the
 inhibit lock is dropped and the client can fall asleep, or lock the screen, or
