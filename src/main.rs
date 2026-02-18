@@ -50,9 +50,9 @@ enum Commands {
     },
     /// Run a doubleidle client (do this on the secondary machine)
     Client {
-        /// The maximum client-local idle time before we reset the idle time
-        #[arg(long, default_value = "4")]
-        idletime_minutes: u64,
+        /// The maximum idle time threshold (default: seconds, suffix with 's' or 'min')
+        #[arg(long, default_value = "240")]
+        idletime: String,
 
         /// Server address (HOST[:PORT]). If omitted, discovers server via mDNS.
         #[arg(value_name = "HOST[:PORT]")]
@@ -95,22 +95,27 @@ async fn main() -> Result<()> {
             server::run(port, interval_seconds).await?;
         }
         Commands::Client {
-            idletime_minutes,
+            idletime,
             address,
         } => {
+            let idletime_seconds = parse_time_value(&idletime)?;
+            if idletime_seconds < 1 {
+                anyhow::bail!("Idle time threshold must be at least 1 second, got {}", idletime_seconds);
+            }
+
             if address.is_none() {
                 info!(
-                    "Starting client with mDNS discovery, idle threshold {} minutes",
-                    idletime_minutes
+                    "Starting client with mDNS discovery, idle threshold {} seconds",
+                    idletime_seconds
                 );
             } else {
                 info!(
-                    "Starting client connecting to {}, idle threshold {} minutes",
+                    "Starting client connecting to {}, idle threshold {} seconds",
                     address.as_ref().unwrap(),
-                    idletime_minutes
+                    idletime_seconds
                 );
             }
-            client::run(address, idletime_minutes).await?;
+            client::run(address, idletime_seconds).await?;
         }
     }
 
