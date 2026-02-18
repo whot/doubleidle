@@ -103,15 +103,15 @@ async fn main() -> Result<()> {
                 anyhow::bail!("Idle time threshold must be at least 1 second, got {}", idletime_seconds);
             }
 
-            if address.is_none() {
+            if let Some(ref address) = address {
                 info!(
-                    "Starting client with mDNS discovery, idle threshold {} seconds",
+                    "Starting client connecting to {}, idle threshold {} seconds",
+                    address,
                     idletime_seconds
                 );
             } else {
                 info!(
-                    "Starting client connecting to {}, idle threshold {} seconds",
-                    address.as_ref().unwrap(),
+                    "Starting client with mDNS discovery, idle threshold {} seconds",
                     idletime_seconds
                 );
             }
