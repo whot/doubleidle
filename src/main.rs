@@ -1,11 +1,39 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use log::info;
+use std::path::PathBuf;
 
 mod client;
 mod server;
+
+/// Get the application config directory, creating it if it doesn't exist
+pub fn get_config_dir() -> Result<PathBuf> {
+    let config_dir = dirs::config_dir()
+        .context("Failed to get config directory")?
+        .join("doubleidle");
+
+    // Create directory if it doesn't exist
+    if !config_dir.exists() {
+        std::fs::create_dir_all(&config_dir)
+            .with_context(|| format!("Failed to create config directory: {:?}", config_dir))?;
+
+        // Set restrictive permissions on Unix systems only when creating
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&config_dir)
+                .with_context(|| format!("Failed to read metadata for {:?}", config_dir))?
+                .permissions();
+            perms.set_mode(0o700);
+            std::fs::set_permissions(&config_dir, perms)
+                .with_context(|| format!("Failed to set permissions for {:?}", config_dir))?;
+        }
+    }
+
+    Ok(config_dir)
+}
 
 /// Parse a time value with optional suffix (s for seconds, min for minutes)
 /// Defaults to seconds if no suffix is provided
@@ -62,6 +90,10 @@ enum Commands {
         /// Server address (HOST[:PORT]). If omitted, discovers server via mDNS.
         #[arg(value_name = "HOST[:PORT]")]
         address: Option<String>,
+
+        /// Semicolon-separated list of allowed server fingerprints. If provided, fingerprints are not loaded from file.
+        #[arg(long, value_name = "FINGERPRINT;...", alias = "allow")]
+        allowlist: Option<String>,
     },
 }
 
@@ -102,7 +134,11 @@ async fn main() -> Result<()> {
             );
             server::run(port, interval_seconds).await?;
         }
-        Commands::Client { idletime, address } => {
+        Commands::Client {
+            idletime,
+            address,
+            allowlist,
+        } => {
             let idletime_seconds = parse_time_value(&idletime)?;
             if idletime_seconds < 1 {
                 anyhow::bail!(
@@ -122,7 +158,7 @@ async fn main() -> Result<()> {
                     idletime_seconds
                 );
             }
-            client::run(address, idletime_seconds).await?;
+            client::run(address, idletime_seconds, allowlist).await?;
         }
     }
 

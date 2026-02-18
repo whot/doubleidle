@@ -18,6 +18,7 @@ ashpd = "0.12"
 zeroconf-tokio = { version = "0.3.0", optional = true }
 dirs = "5.0"
 chrono = "0.4"
+uuid = { version = "1.0", features = ["v4"] }
 
 [patch.crates-io]
 zeroconf-tokio = { path = "vendor/zeroconf-tokio" }

@@ -7,17 +7,81 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 use tokio::time;
+use uuid::Uuid;
 #[cfg(feature = "zeroconf")]
 use zeroconf_tokio::{prelude::*, MdnsService, MdnsServiceAsync, ServiceType};
 
 const HANDSHAKE: &str = "DOUBLEIDLE";
+const MAX_FINGERPRINT_LENGTH: usize = 1024;
+
+fn load_or_generate_fingerprint() -> Result<String> {
+    let config_dir = crate::get_config_dir()?;
+    let fingerprint_path = config_dir.join("server-fingerprint.txt");
+
+    if fingerprint_path.exists() {
+        let fingerprint_raw = std::fs::read_to_string(&fingerprint_path)
+            .with_context(|| format!("Failed to read fingerprint from {:?}", fingerprint_path))?;
+
+        let fingerprint = fingerprint_raw.trim().to_string();
+
+        if fingerprint.is_empty() {
+            anyhow::bail!("Fingerprint file at {:?} is empty", fingerprint_path);
+        }
+
+        // Check for embedded newlines (after trimming leading/trailing whitespace)
+        if fingerprint.contains('\n') || fingerprint.contains('\r') {
+            anyhow::bail!(
+                "Fingerprint file at {:?} contains multiple lines or embedded newlines",
+                fingerprint_path
+            );
+        }
+
+        if fingerprint.len() > MAX_FINGERPRINT_LENGTH {
+            anyhow::bail!(
+                "Fingerprint in {:?} exceeds maximum length of {} bytes (got {})",
+                fingerprint_path,
+                MAX_FINGERPRINT_LENGTH,
+                fingerprint.len()
+            );
+        }
+
+        info!("Loaded existing fingerprint from {:?}", fingerprint_path);
+        Ok(fingerprint)
+    } else {
+        let fingerprint = Uuid::new_v4().to_string();
+        std::fs::write(&fingerprint_path, &fingerprint)
+            .with_context(|| format!("Failed to write fingerprint to {:?}", fingerprint_path))?;
+
+        // Set restrictive permissions on Unix systems
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&fingerprint_path)
+                .with_context(|| format!("Failed to read metadata for {:?}", fingerprint_path))?
+                .permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(&fingerprint_path, perms)
+                .with_context(|| format!("Failed to set permissions for {:?}", fingerprint_path))?;
+        }
+
+        info!(
+            "Generated new fingerprint and saved to {:?}",
+            fingerprint_path
+        );
+        info!("Server fingerprint: {}", fingerprint);
+        Ok(fingerprint)
+    }
+}
 
 pub async fn run(port: u16, interval_secs: u64) -> Result<()> {
+    let fingerprint = load_or_generate_fingerprint()?;
+
     let listener = TcpListener::bind(format!("0.0.0.0:{}", port))
         .await
         .with_context(|| format!("Failed to bind to port {}", port))?;
 
     info!("Server listening on port {}", port);
+    info!("Server fingerprint: {}", fingerprint);
 
     // Register mDNS service
     #[cfg(feature = "zeroconf")]
@@ -60,8 +124,9 @@ pub async fn run(port: u16, interval_secs: u64) -> Result<()> {
             Ok((stream, addr)) => {
                 debug!("New connection from {}", addr);
                 let rx = tx.subscribe();
+                let fp = fingerprint.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_client(stream, rx).await {
+                    if let Err(e) = handle_client(stream, rx, fp).await {
                         warn!("Client {} error: {}", addr, e);
                     }
                     debug!("Client {} disconnected", addr);
@@ -101,7 +166,11 @@ async fn monitor_idle_state(
     }
 }
 
-async fn handle_client(mut stream: TcpStream, mut rx: broadcast::Receiver<Duration>) -> Result<()> {
+async fn handle_client(
+    mut stream: TcpStream,
+    mut rx: broadcast::Receiver<Duration>,
+    fingerprint: String,
+) -> Result<()> {
     let (reader, mut writer) = stream.split();
     let mut reader = BufReader::new(reader);
 
@@ -120,6 +189,22 @@ async fn handle_client(mut stream: TcpStream, mut rx: broadcast::Receiver<Durati
         warn!("Invalid handshake: {}", handshake);
         anyhow::bail!("Invalid handshake");
     }
+
+    // Send fingerprint to client
+    writer
+        .write_all(fingerprint.as_bytes())
+        .await
+        .context("Failed to send fingerprint")?;
+    writer
+        .write_all(b"\n")
+        .await
+        .context("Failed to send fingerprint newline")?;
+    writer
+        .flush()
+        .await
+        .context("Failed to flush fingerprint")?;
+
+    debug!("Sent fingerprint to client");
 
     info!("Client authenticated successfully");
 
