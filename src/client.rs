@@ -3,8 +3,6 @@
 use anyhow::{Context, Result};
 use ashpd::desktop::inhibit::{InhibitFlags, InhibitProxy};
 use ashpd::desktop::Request;
-#[cfg(feature = "zeroconf")]
-use zeroconf_tokio::{prelude::*, BrowserEvent, MdnsBrowser, MdnsBrowserAsync, ServiceType};
 use log::{debug, error, info};
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,6 +10,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time;
+#[cfg(feature = "zeroconf")]
+use zeroconf_tokio::{prelude::*, BrowserEvent, MdnsBrowser, MdnsBrowserAsync, ServiceType};
 
 const HANDSHAKE: &str = "DOUBLEIDLE\n";
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(30);
@@ -57,13 +57,15 @@ fn parse_address(address: &str) -> Result<(String, u16)> {
 async fn discover_server(timeout: Duration) -> Result<Option<(String, u16)>> {
     info!("Discovering doubleidle servers via mDNS...");
 
-    let service_type = ServiceType::new("doubleidle", "tcp")
-        .context("Failed to create service type")?;
+    let service_type =
+        ServiceType::new("doubleidle", "tcp").context("Failed to create service type")?;
     let browser = MdnsBrowser::new(service_type);
-    let mut browser_async = MdnsBrowserAsync::new(browser)
-        .context("Failed to create async browser")?;
+    let mut browser_async =
+        MdnsBrowserAsync::new(browser).context("Failed to create async browser")?;
 
-    browser_async.start_with_timeout(timeout).await
+    browser_async
+        .start_with_timeout(timeout)
+        .await
         .context("Failed to start mDNS browser")?;
 
     // Wait for first service discovery
@@ -93,7 +95,6 @@ async fn discover_server(timeout: Duration) -> Result<Option<(String, u16)>> {
     // Timeout or no services found
     Ok(None)
 }
-
 
 /// Connect to the server and read the periodic idletime data.
 ///
@@ -217,7 +218,15 @@ pub async fn run(address: Option<String>, idletime_seconds: u64) -> Result<()> {
     tokio::spawn(async move {
         loop {
             info!("Connecting to {}:{}", host, port);
-            match connect_and_read_idle_time(&host, port, server_idle_time_w.clone(), server_connected_w.clone(), idle_update_tx.clone()).await {
+            match connect_and_read_idle_time(
+                &host,
+                port,
+                server_idle_time_w.clone(),
+                server_connected_w.clone(),
+                idle_update_tx.clone(),
+            )
+            .await
+            {
                 Ok(_) => {
                     // Mark as disconnected and notify main loop
                     {
@@ -398,43 +407,85 @@ mod tests {
     #[test]
     fn test_parse_address_ipv4() {
         // IPv4 with port
-        assert_eq!(parse_address("192.168.1.1:8080").unwrap(), ("192.168.1.1".to_string(), 8080));
+        assert_eq!(
+            parse_address("192.168.1.1:8080").unwrap(),
+            ("192.168.1.1".to_string(), 8080)
+        );
 
         // IPv4 without port (uses default)
-        assert_eq!(parse_address("192.168.1.1").unwrap(), ("192.168.1.1".to_string(), DEFAULT_PORT));
+        assert_eq!(
+            parse_address("192.168.1.1").unwrap(),
+            ("192.168.1.1".to_string(), DEFAULT_PORT)
+        );
     }
 
     #[test]
     fn test_parse_address_hostname() {
         // Hostname with port
-        assert_eq!(parse_address("example.com:8080").unwrap(), ("example.com".to_string(), 8080));
+        assert_eq!(
+            parse_address("example.com:8080").unwrap(),
+            ("example.com".to_string(), 8080)
+        );
 
         // Hostname without port
-        assert_eq!(parse_address("example.com").unwrap(), ("example.com".to_string(), DEFAULT_PORT));
+        assert_eq!(
+            parse_address("example.com").unwrap(),
+            ("example.com".to_string(), DEFAULT_PORT)
+        );
 
         // Hostname with subdomain
-        assert_eq!(parse_address("foo.bar.example.com:9999").unwrap(), ("foo.bar.example.com".to_string(), 9999));
+        assert_eq!(
+            parse_address("foo.bar.example.com:9999").unwrap(),
+            ("foo.bar.example.com".to_string(), 9999)
+        );
     }
 
     #[test]
     fn test_parse_address_ipv6_brackets() {
         // IPv6 with brackets and port
-        assert_eq!(parse_address("[fe80::1]:8080").unwrap(), ("fe80::1".to_string(), 8080));
-        assert_eq!(parse_address("[::1]:24999").unwrap(), ("::1".to_string(), 24999));
-        assert_eq!(parse_address("[2001:db8::1]:443").unwrap(), ("2001:db8::1".to_string(), 443));
+        assert_eq!(
+            parse_address("[fe80::1]:8080").unwrap(),
+            ("fe80::1".to_string(), 8080)
+        );
+        assert_eq!(
+            parse_address("[::1]:24999").unwrap(),
+            ("::1".to_string(), 24999)
+        );
+        assert_eq!(
+            parse_address("[2001:db8::1]:443").unwrap(),
+            ("2001:db8::1".to_string(), 443)
+        );
 
         // IPv6 with brackets but no port (uses default)
-        assert_eq!(parse_address("[fe80::1]").unwrap(), ("fe80::1".to_string(), DEFAULT_PORT));
-        assert_eq!(parse_address("[::1]").unwrap(), ("::1".to_string(), DEFAULT_PORT));
+        assert_eq!(
+            parse_address("[fe80::1]").unwrap(),
+            ("fe80::1".to_string(), DEFAULT_PORT)
+        );
+        assert_eq!(
+            parse_address("[::1]").unwrap(),
+            ("::1".to_string(), DEFAULT_PORT)
+        );
     }
 
     #[test]
     fn test_parse_address_ipv6_bare() {
         // Bare IPv6 addresses without brackets (no port possible)
-        assert_eq!(parse_address("fe80::1").unwrap(), ("fe80::1".to_string(), DEFAULT_PORT));
-        assert_eq!(parse_address("::1").unwrap(), ("::1".to_string(), DEFAULT_PORT));
-        assert_eq!(parse_address("2001:db8::1").unwrap(), ("2001:db8::1".to_string(), DEFAULT_PORT));
-        assert_eq!(parse_address("fe80::1:2345").unwrap(), ("fe80::1:2345".to_string(), DEFAULT_PORT));
+        assert_eq!(
+            parse_address("fe80::1").unwrap(),
+            ("fe80::1".to_string(), DEFAULT_PORT)
+        );
+        assert_eq!(
+            parse_address("::1").unwrap(),
+            ("::1".to_string(), DEFAULT_PORT)
+        );
+        assert_eq!(
+            parse_address("2001:db8::1").unwrap(),
+            ("2001:db8::1".to_string(), DEFAULT_PORT)
+        );
+        assert_eq!(
+            parse_address("fe80::1:2345").unwrap(),
+            ("fe80::1:2345".to_string(), DEFAULT_PORT)
+        );
     }
 
     #[test]
