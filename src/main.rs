@@ -149,9 +149,9 @@ mod tests {
         // Invalid inputs
         assert!(parse_time_value("invalid").is_err());
         assert!(parse_time_value("").is_err());
-        assert!(parse_time_value("0").unwrap() == 0);
-        assert!(parse_time_value("0s").unwrap() == 0);
-        assert!(parse_time_value("0min").unwrap() == 0);
+        assert_eq!(parse_time_value("0").unwrap(), 0);
+        assert_eq!(parse_time_value("0s").unwrap(), 0);
+        assert_eq!(parse_time_value("0min").unwrap(), 0);
 
         // Overflow check
         assert!(parse_time_value("18446744073709551615min").is_err());
