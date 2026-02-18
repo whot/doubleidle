@@ -4,9 +4,10 @@ use anyhow::{Context, Result};
 use ashpd::desktop::inhibit::{InhibitFlags, InhibitProxy};
 use ashpd::desktop::Request;
 use log::{debug, error, info};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time;
@@ -18,6 +19,70 @@ const RECONNECT_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_PORT: u16 = 24999;
 const TIMER_BUFFER: Duration = Duration::from_secs(5);
 const ONE_DAY: Duration = Duration::from_secs(86400);
+const MAX_FINGERPRINT_LENGTH: usize = 1024;
+
+fn load_allowed_fingerprints() -> Result<HashSet<String>> {
+    let config_dir = crate::get_config_dir()?;
+    let allowed_servers_path = config_dir.join("allowed-servers.txt");
+
+    if !allowed_servers_path.exists() {
+        error!(
+            "No allowed servers file found at {:?}",
+            allowed_servers_path
+        );
+        anyhow::bail!(
+            "No allowed servers file found. Create {:?} with one fingerprint per line, \
+             or use --allow to specify fingerprints on the command line",
+            allowed_servers_path
+        );
+    }
+
+    let content = std::fs::read_to_string(&allowed_servers_path).with_context(|| {
+        format!(
+            "Failed to read allowed servers from {:?}",
+            allowed_servers_path
+        )
+    })?;
+
+    let fingerprints: HashSet<String> = content
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                None
+            } else if trimmed.len() > MAX_FINGERPRINT_LENGTH {
+                error!(
+                    "Fingerprint in {:?} exceeds maximum length of {} bytes: {:?}",
+                    allowed_servers_path,
+                    MAX_FINGERPRINT_LENGTH,
+                    &trimmed[..MAX_FINGERPRINT_LENGTH.min(50)]
+                );
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+        .collect();
+
+    if fingerprints.is_empty() {
+        error!(
+            "Allowed servers file at {:?} contains no valid fingerprints",
+            allowed_servers_path
+        );
+        anyhow::bail!(
+            "Allowed servers file at {:?} contains no valid fingerprints. \
+             Add at least one fingerprint, or use --allow on the command line",
+            allowed_servers_path
+        );
+    }
+
+    info!(
+        "Loaded {} allowed fingerprints from {:?}",
+        fingerprints.len(),
+        allowed_servers_path
+    );
+    Ok(fingerprints)
+}
 
 fn parse_address(address: &str) -> Result<(String, u16)> {
     // Handle [host]:port format (for IPv6 addresses)
@@ -106,6 +171,7 @@ async fn connect_and_read_idle_time(
     server_idle_time: Arc<Mutex<Duration>>,
     server_connected: Arc<Mutex<bool>>,
     idle_update_notify: tokio::sync::mpsc::UnboundedSender<()>,
+    allowed_fingerprints: HashSet<String>,
 ) -> Result<()> {
     // Format address for connection - wrap IPv6 addresses in brackets
     let connection_addr = if host.contains(':') {
@@ -130,6 +196,50 @@ async fn connect_and_read_idle_time(
 
     debug!("Handshake sent successfully");
 
+    // Receive and verify fingerprint with bounded read
+    let mut reader = BufReader::new(stream);
+    let mut fingerprint_raw = String::new();
+    let bytes_read = tokio::select! {
+        result = reader.read_line(&mut fingerprint_raw) => {
+            result.context("Failed to read fingerprint from server")?
+        }
+        _ = time::sleep(Duration::from_secs(5)) => {
+            anyhow::bail!("Timeout waiting for server fingerprint");
+        }
+    };
+
+    if bytes_read == 0 {
+        error!("Server closed connection before sending fingerprint");
+        anyhow::bail!("Server sent no fingerprint");
+    }
+
+    if fingerprint_raw.len() > MAX_FINGERPRINT_LENGTH {
+        error!(
+            "Fingerprint exceeds maximum length of {} bytes",
+            MAX_FINGERPRINT_LENGTH
+        );
+        anyhow::bail!("Server sent invalid fingerprint (too long)");
+    }
+
+    let fingerprint = fingerprint_raw.trim().to_string();
+    debug!("Received fingerprint from server: {}", fingerprint);
+
+    if fingerprint.is_empty() {
+        error!("Received empty fingerprint from server");
+        anyhow::bail!("Server sent empty fingerprint");
+    }
+
+    if !allowed_fingerprints.contains(&fingerprint) {
+        error!("Server fingerprint '{}' not in allowed list", fingerprint);
+        anyhow::bail!(
+            "Server fingerprint not authorized. Add '{}' to allowed-servers.txt or use --allow={}",
+            fingerprint,
+            fingerprint
+        );
+    }
+
+    info!("Server fingerprint verified: {}", fingerprint);
+
     // Mark as connected
     {
         let mut connected = server_connected.lock().await;
@@ -138,7 +248,7 @@ async fn connect_and_read_idle_time(
 
     let mut buf = [0u8; 8];
     loop {
-        match stream.read_exact(&mut buf).await {
+        match reader.read_exact(&mut buf).await {
             Ok(_) => {
                 let idle_secs = u64::from_be_bytes(buf);
                 let idle_duration = Duration::from_secs(idle_secs);
@@ -167,7 +277,45 @@ async fn connect_and_read_idle_time(
 /// use the Inhibit portal to prevent suspend/idle and keep reading
 /// server idle time info. Once the server idle info goes past the threshold
 /// drop the Inhibit lock.
-pub async fn run(address: Option<String>, idletime_seconds: u64) -> Result<()> {
+pub async fn run(
+    address: Option<String>,
+    idletime_seconds: u64,
+    allowlist: Option<String>,
+) -> Result<()> {
+    let allowed_fingerprints = if let Some(allowlist_str) = allowlist {
+        // Parse semicolon-separated fingerprints from command line
+        let fingerprints: HashSet<String> = allowlist_str
+            .split(';')
+            .filter_map(|s| {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    None
+                } else if trimmed.len() > MAX_FINGERPRINT_LENGTH {
+                    error!(
+                        "Fingerprint in --allow argument exceeds maximum length of {} bytes",
+                        MAX_FINGERPRINT_LENGTH
+                    );
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            })
+            .collect();
+
+        if fingerprints.is_empty() {
+            anyhow::bail!("No valid fingerprints provided in --allow argument");
+        }
+
+        info!(
+            "Using {} fingerprints from command line allowlist",
+            fingerprints.len()
+        );
+        fingerprints
+    } else {
+        // Load from file
+        load_allowed_fingerprints()?
+    };
+
     let (host, port) = match address {
         Some(addr) => parse_address(&addr)?,
         None => {
@@ -224,6 +372,7 @@ pub async fn run(address: Option<String>, idletime_seconds: u64) -> Result<()> {
                 server_idle_time_w.clone(),
                 server_connected_w.clone(),
                 idle_update_tx.clone(),
+                allowed_fingerprints.clone(),
             )
             .await
             {
