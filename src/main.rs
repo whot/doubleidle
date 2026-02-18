@@ -13,12 +13,17 @@ fn parse_time_value(s: &str) -> Result<u64> {
     let s = s.trim();
 
     if let Some(value_str) = s.strip_suffix("min") {
-        let value = value_str.trim().parse::<u64>()
+        let value = value_str
+            .trim()
+            .parse::<u64>()
             .map_err(|_| anyhow!("Invalid number: {}", value_str))?;
-        value.checked_mul(60)
+        value
+            .checked_mul(60)
             .ok_or_else(|| anyhow!("Time value too large: {} minutes exceeds maximum", value))
     } else if let Some(value_str) = s.strip_suffix("s") {
-        let value = value_str.trim().parse::<u64>()
+        let value = value_str
+            .trim()
+            .parse::<u64>()
             .map_err(|_| anyhow!("Invalid number: {}", value_str))?;
         Ok(value)
     } else {
@@ -85,7 +90,10 @@ async fn main() -> Result<()> {
             let interval_seconds = parse_time_value(&interval)?;
 
             if interval_seconds < 1 {
-                anyhow::bail!("Interval must be at least 1 second, got {}", interval_seconds);
+                anyhow::bail!(
+                    "Interval must be at least 1 second, got {}",
+                    interval_seconds
+                );
             }
 
             info!(
@@ -94,20 +102,19 @@ async fn main() -> Result<()> {
             );
             server::run(port, interval_seconds).await?;
         }
-        Commands::Client {
-            idletime,
-            address,
-        } => {
+        Commands::Client { idletime, address } => {
             let idletime_seconds = parse_time_value(&idletime)?;
             if idletime_seconds < 1 {
-                anyhow::bail!("Idle time threshold must be at least 1 second, got {}", idletime_seconds);
+                anyhow::bail!(
+                    "Idle time threshold must be at least 1 second, got {}",
+                    idletime_seconds
+                );
             }
 
             if let Some(ref address) = address {
                 info!(
                     "Starting client connecting to {}, idle threshold {} seconds",
-                    address,
-                    idletime_seconds
+                    address, idletime_seconds
                 );
             } else {
                 info!(
