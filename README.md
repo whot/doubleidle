@@ -28,7 +28,9 @@ This is a typical Rust project, see the Rust documentation for details on
 cargo.
 
 We recommend to build with zeroconf support so server detection is automatic.
-
+Note that zeroconf requires `apt install libclang-dev libavahi-client-dev` on Ubuntu/Debian
+and `dnf install clang-devel avahi-devel` on Fedora.
+ 
 ```
 $ cargo build --features zeroconf
 $ cargo install
