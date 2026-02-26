@@ -1,5 +1,132 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+//! Keep a machine from suspending while another machine is active.
+//!
+//! You've got two machines. One is your main desktop that you actually use, the other is
+//! something you need to glance at periodically - maybe a reference manual, logs, or a
+//! terminal you check occasionally. The problem: that second machine locks itself because
+//! you're not actively using it, and now you're stuck typing passwords all day.
+//!
+//! Disabling the screen lock isn't an option because security matters.
+//!
+//! `doubleidle` fixes this. Run the server on the machine you're actively using, and the
+//! client on the machines you want to keep awake. The client prevents suspension and screen
+//! locking via the [Inhibit portal] while the server is active (below its idle threshold).
+//! When the server goes idle past the threshold, the client drops the lock and lets the
+//! machine do its thing.
+//!
+//! [Inhibit portal]: https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.Inhibit.html
+//!
+//! # Example
+//!
+//! Start the server on your main machine:
+//!
+//! ```console
+//! $ doubleidle server
+//! [10:37 INFO ] Starting server on port 24999 with interval 30s
+//! [10:37 INFO ] Generated new fingerprint and saved to "/home/user/.config/doubleidle/server-fingerprint.txt"
+//! [10:37 INFO ] Server fingerprint: 9e754f83-712f-4cce-8ce5-ab0eb7e660e9
+//! [10:37 INFO ] Server listening on port 24999
+//! ```
+//!
+//! On first startup, the server generates a UUID fingerprint and saves it. You'll need this
+//! to authorize clients. The fingerprint doesn't have to be a UUID - you can replace it with
+//! any string you want, but UUIDs work fine.
+//!
+//! Start the client on the secondary machine (with zeroconf enabled):
+//!
+//! ```console
+//! $ doubleidle client --allow=9e754f83-712f-4cce-8ce5-ab0eb7e660e9
+//! [10:38 INFO ] Using 1 fingerprints from command line allowlist
+//! [10:38 INFO ] Starting client with mDNS discovery, idle threshold 240 seconds
+//! [10:38 INFO ] Discovering doubleidle servers via mDNS...
+//! [10:38 INFO ] Discovered server at main-machine.local:24999
+//! [10:38 INFO ] Connecting to main-machine.local:24999
+//! [10:38 INFO ] Server fingerprint verified: 9e754f83-712f-4cce-8ce5-ab0eb7e660e9
+//! [10:38 INFO ] Server active (30s), creating inhibit lock
+//! [10:38 INFO ] Inhibit lock created successfully
+//! ```
+//!
+//! Without zeroconf, specify the server address explicitly:
+//!
+//! ```console
+//! $ doubleidle client --allow=9e754f83-712f-4cce-8ce5-ab0eb7e660e9 main-machine.local
+//! ```
+//!
+//! The client only connects to servers with an allowed fingerprint. You can pass fingerprints
+//! on the command line with `--allow`, or create `$XDG_CONFIG_HOME/doubleidle/allowed-servers.txt`
+//! with one fingerprint per line. If you use `--allow`, the file is ignored.
+//!
+//! # How it works
+//!
+//! The server monitors idle time on the machine it's running on and broadcasts that information
+//! to connected clients. Clients use this to decide whether to hold an inhibit lock.
+//!
+//! When the server's idle time is below the client's threshold, the client creates an inhibit
+//! lock via the [Inhibit portal], preventing the system from suspending or engaging the
+//! screensaver. Once the server goes idle past the threshold (or disconnects), the client
+//! drops the lock.
+//!
+//! The server sends idle time updates at regular intervals (default: 30 seconds). Clients
+//! also use a timer to drop the lock at the right time even if the server stops sending
+//! updates.
+//!
+//! # Security
+//!
+//! Servers identify themselves with a fingerprint - a string saved to
+//! `$XDG_CONFIG_HOME/doubleidle/server-fingerprint.txt`. On first startup, the server
+//! generates a random UUID, but you can replace it with any string.
+//!
+//! Clients only connect to servers whose fingerprints are in their allowlist. This prevents
+//! random servers on your network from controlling your machine's idle behavior.
+//!
+//! Fingerprints are not secret - they're sent over the network in plaintext. They exist to
+//! prevent accidental connections, not to provide cryptographic authentication. If you need
+//! real security, use a firewall or run doubleidle over a VPN.
+//!
+//! # Command-line options
+//!
+//! ## Server
+//!
+//! ```console
+//! $ doubleidle server [--port PORT] [--interval INTERVAL]
+//! ```
+//!
+//! - `--port`: TCP port to listen on (default: 24999)
+//! - `--interval`: How often to send idle time updates to clients. Takes a number with
+//!   optional suffix: `30` or `30s` for seconds, `5min` for minutes (default: 30 seconds)
+//!
+//! ## Client
+//!
+//! ```console
+//! $ doubleidle client [OPTIONS] [HOST[:PORT]]
+//! ```
+//!
+//! - `HOST[:PORT]`: Server address to connect to. If omitted, discovers server via mDNS
+//!   (requires zeroconf support). Supports IPv4, IPv6, and hostnames.
+//! - `--idletime`: Maximum idle time threshold before dropping the inhibit lock. Takes a
+//!   number with optional suffix: `240` or `240s` for seconds, `4min` for minutes
+//!   (default: 240 seconds)
+//! - `--allow`: Semicolon-separated list of allowed server fingerprints. If provided,
+//!   `allowed-servers.txt` is ignored.
+//!
+//! # Building
+//!
+//! Build with zeroconf support for automatic server discovery:
+//!
+//! ```console
+//! $ cargo build --features zeroconf
+//! ```
+//!
+//! On Ubuntu/Debian, you'll need: `apt install libclang-dev libavahi-client-dev`
+//! On Fedora: `dnf install clang-devel avahi-devel`
+//!
+//! Without zeroconf (no dependencies, but you must specify server addresses manually):
+//!
+//! ```console
+//! $ cargo build --no-default-features
+//! ```
+
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use log::info;
@@ -87,7 +214,7 @@ enum Commands {
         #[arg(long, default_value = "240")]
         idletime: String,
 
-        /// Server address (HOST[:PORT]). If omitted, discovers server via mDNS.
+        /// Server address (HOST\[:PORT\]). If omitted, discovers server via mDNS.
         #[arg(value_name = "HOST[:PORT]")]
         address: Option<String>,
 
