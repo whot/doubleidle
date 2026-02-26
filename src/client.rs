@@ -161,6 +161,22 @@ async fn discover_server(timeout: Duration) -> Result<Option<(String, u16)>> {
     Ok(None)
 }
 
+/// Helper function to properly close and drop an inhibit request
+async fn drop_inhibit_lock(inhibit_request: &Arc<Mutex<Option<Request<()>>>>, reason: &str) {
+    // Take ownership of the request and drop the guard before awaiting
+    let request = {
+        let mut request_guard = inhibit_request.lock().await;
+        request_guard.take()
+    };
+
+    if let Some(request) = request {
+        info!("{}", reason);
+        if let Err(e) = request.close().await {
+            error!("Failed to close inhibit request: {}", e);
+        }
+    }
+}
+
 /// Connect to the server and read the periodic idletime data.
 ///
 /// idletimedata is saved into `server_idle_time` for processing by the caller.
@@ -427,11 +443,7 @@ pub async fn run(
 
                 if !is_connected {
                     // Drop inhibit lock immediately when server disconnects
-                    let mut request_guard = inhibit_request.lock().await;
-                    if request_guard.is_some() {
-                        info!("Server disconnected, dropping inhibit lock");
-                        *request_guard = None;
-                    }
+                    drop_inhibit_lock(&inhibit_request, "Server disconnected, dropping inhibit lock").await;
                     // Reset timer since we're no longer tracking server state
                     sleep.as_mut().reset(time::Instant::now() + ONE_DAY);
                     previous_server_idle = None;
@@ -445,12 +457,11 @@ pub async fn run(
                 // Check if server is already past threshold
                 if server_idle >= idletime_threshold {
                     debug!("Server idle ({:?}) already past threshold ({:?})", server_idle, idletime_threshold);
-                    let mut request_guard = inhibit_request.lock().await;
-                    if request_guard.is_some() {
-                        info!("Server idle ({:?}) past threshold ({:?}), dropping inhibit lock",
-                            server_idle, idletime_threshold);
-                        *request_guard = None;
-                    }
+                    drop_inhibit_lock(
+                        &inhibit_request,
+                        &format!("Server idle ({:?}) past threshold ({:?}), dropping inhibit lock",
+                            server_idle, idletime_threshold)
+                    ).await;
                     // Reset timer to prevent unnecessary firing
                     sleep.as_mut().reset(time::Instant::now() + ONE_DAY);
                     previous_server_idle = Some(server_idle);
@@ -523,23 +534,18 @@ pub async fn run(
                 let is_connected = *server_connected.lock().await;
 
                 if !is_connected {
-                    info!("Timer fired but server disconnected, dropping inhibit lock");
-                    let mut request_guard = inhibit_request.lock().await;
-                    if request_guard.is_some() {
-                        *request_guard = None;
-                    }
+                    drop_inhibit_lock(&inhibit_request, "Timer fired but server disconnected, dropping inhibit lock").await;
                     previous_server_idle = None;
                     continue;
                 }
 
                 let server_idle = *server_idle_time.lock().await;
 
-                let mut request_guard = inhibit_request.lock().await;
-                if request_guard.is_some() {
-                    info!("Timer fired: server idle ({:?}) past threshold ({:?}), dropping inhibit lock",
-                        server_idle, idletime_threshold);
-                    *request_guard = None;
-                }
+                drop_inhibit_lock(
+                    &inhibit_request,
+                    &format!("Timer fired: server idle ({:?}) past threshold ({:?}), dropping inhibit lock",
+                        server_idle, idletime_threshold)
+                ).await;
 
                 // Reset previous_server_idle so next update is treated as a fresh start
                 // This ensures the lock will be recreated if server is still below threshold
